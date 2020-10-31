@@ -762,6 +762,8 @@ lazy val scribeBackend = (projectMatrix in file("logging/scribe"))
     )
   )
   .jvmPlatform(scalaVersions = List(scala2_12, scala2_13), settings = intellijImportOnly213)
+  .jsPlatform(scalaVersions = List(scala2_11, scala2_12, scala2_12), settings = commonJsSettings ++ intellijSkipImport)
+  .nativePlatform(scalaVersions = List(scala2_11), settings = commonNativeSettings ++ intellijSkipImport)
   .dependsOn(core)
 
 lazy val slf4jBackend = (projectMatrix in file("logging/slf4j"))
