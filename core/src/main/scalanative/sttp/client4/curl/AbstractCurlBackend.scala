@@ -15,6 +15,7 @@ import sttp.monad.MonadError
 import sttp.monad.syntax._
 
 import java.io.{ByteArrayInputStream, InputStream}
+import java.nio.charset.StandardCharsets
 
 import scala.collection.immutable.Seq
 import scala.collection.mutable.ArrayBuffer
@@ -25,7 +26,13 @@ import scala.scalanative.libc.string._
 import scala.scalanative.unsafe.{CSize, Ptr, _}
 import scala.scalanative.unsigned._
 
-abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean) extends GenericBackend[F, Any] {
+/** A curl backend, which supports the capabilities `P`. Backends which only support the effect `F` should extend
+  * [[AbstractCurlBackend]].
+  *
+  * Backends which can stream the response body should override [[isStreamResponse]] and [[handleStream]], and the ones
+  * which accept streaming request bodies should override [[streamBodyToBytes]].
+  */
+abstract class GenericCurlBackend[F[_], P](_monad: MonadError[F], verbose: Boolean) extends GenericBackend[F, P] {
   override implicit def monad: MonadError[F] = _monad
 
   /** Given a [[CurlHandle]], perform the request and return a [[CurlCode]]. */
@@ -36,10 +43,35 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
     */
   protected def cleanupCurl(c: CurlHandle): F[Unit] = monad.eval(c.cleanup())
 
+  /** Whether the given (leaf) response description is a streaming response, which has to be handled by
+    * [[handleStream]]. If any branch of a request's response description is such a response, the whole request is
+    * handled by [[handleStream]].
+    */
+  protected def isStreamResponse(leaf: GenericResponseAs[_, _]): Boolean = false
+
+  /** Handles a request whose response might be streamed, or which has a streaming request body. All the options of the
+    * easy handle are set, except for the write function and data: they have to be set here, as well as
+    * `CURLOPT_HEADERDATA` is already set to `spaces.headersResp`, which is where the response headers are accumulated.
+    *
+    * Everything which was allocated for the request is passed here, as the transfer outlives the `send` call: the
+    * implementation takes over the responsibility for releasing `curl` (using [[cleanupCurl]]), `spaces` (the memory
+    * has to be freed), and `resources`, once the transfer is done, fails or is cancelled.
+    */
+  protected def handleStream[T](
+      request: GenericRequest[T, R],
+      curl: CurlHandle,
+      spaces: CurlSpaces,
+      resources: DetachedResources
+  ): F[Response[T]] = monad.error(new UnsupportedOperationException("This curl backend doesn't support streams"))
+
+  /** Reads the whole stream request body into memory. */
+  protected def streamBodyToBytes(stream: Any): F[Array[Byte]] =
+    monad.error(new IllegalStateException("CurlBackend does not support stream request body"))
+
   /** Same as [[performCurl]], but also checks and throws runtime exceptions on bad [[CurlCode]]s. */
   private final def perform(c: CurlHandle) = performCurl(c).flatMap(lift)
 
-  type R = Any with Effect[F]
+  type R = P with Effect[F]
 
   override def close(): F[Unit] = monad.unit(())
 
@@ -47,6 +79,7 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
   private class Context() {
     implicit val zone: Zone = Zone.open()
     private val headers = ArrayBuffer[CurlList]()
+    private var detached = false
 
     /** Create a new Headers list that gets cleaned up when the context is destroyed. */
     def transformHeaders(reqHeaders: Iterable[Header]): CurlList = {
@@ -71,7 +104,18 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
       h
     }
 
-    def close() = {
+    /** Transfers the cleanup of everything in this context to the returned [[DetachedResources]]. After this call,
+      * close() doesn't free anything.
+      */
+    def detach(): DetachedResources = {
+      detached = true
+      new DetachedResources(() => {
+        zone.close()
+        headers.foreach(l => if (l.ptr != null) l.ptr.free())
+      })
+    }
+
+    def close() = if (!detached) {
       zone.close()
       headers.foreach(l => if (l.ptr != null) l.ptr.free())
     }
@@ -132,13 +176,28 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
         val spaces = responseSpace
         FileHelpers.getFilePath(request.response.delegate) match {
           case Some(file) => handleFile(request, curl, file, spaces)
-          case None if InputStreamResponseDetector.containsInputStreamResponse(request.response.delegate) =>
+          case None
+              if containsResponse(request.response.delegate, isStreamResponse) ||
+                request.body.isInstanceOf[StreamBody[_, _]] =>
+            curl.option(HeaderFunction, AbstractCurlBackend.wdFunc)
+            curl.option(HeaderData, spaces.headersResp)
+            curl.option(TimeoutMs, request.options.readTimeout.toMillis)
+            curl.option(Url, request.uri.toString)
+            setMethod(curl, request.method)
+            // the transfer outlives this request-scoped context, so everything is handed over to `handleStream`
+            setRequestBody(curl, request.body, request.method).flatMap(_ =>
+              handleStream(request, curl, spaces, ctx.detach())
+            )
+          case None if containsResponse(request.response.delegate, InputStreamResponseDetector.isInputStream) =>
             handleBaseWithMulti(request, curl, spaces)
           case None => handleBase(request, curl, spaces)
         }
       }
 
-      Context.evaluateUsing(ctx => perform(ctx))
+      // everything which is allocated for the request (the easy handle, the zone, the headers) has to be allocated
+      // each time the effect is run, not when it's created: an effect can be run multiple times (e.g. when retrying)
+      // or never
+      monad.flatMap(monad.unit(()))(_ => Context.evaluateUsing(ctx => perform(ctx)))
     }
 
   private def adjustExceptions[T](request: GenericRequest[_, _])(t: => F[T]): F[T] =
@@ -159,7 +218,7 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
     setRequestBody(curl, request.body, request.method)
     monad.flatMap(perform(curl)) { _ =>
       curl.info(ResponseCode, spaces.httpCode)
-      val responseBody = fromCString((!spaces.bodyResp)._1)
+      val responseBody = rawBody(spaces.bodyResp)
       val (statusText, responseHeaders) = parseHeadersAndStatus(fromCString((!spaces.headersResp)._1))
       val httpCode = StatusCode((!spaces.httpCode).toInt)
 
@@ -222,23 +281,24 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
   }
 
   private object InputStreamResponseDetector {
-
-    /** Recursively checks if a response descriptor contains any InputStream response types. This inspects through
-      * MappedResponseAs, ResponseAsFromMetadata conditions, and ResponseAsBoth. Returns true if ANY branch might
-      * produce an InputStream response.
-      */
-    def containsInputStreamResponse(delegate: GenericResponseAs[_, _]): Boolean =
-      delegate match {
-        case ResponseAsInputStream(_) | ResponseAsInputStreamUnsafe => true
-        case MappedResponseAs(raw, _, _)                            => containsInputStreamResponse(raw)
-        case rfm: ResponseAsFromMetadata[_, _]                      =>
-          containsInputStreamResponse(rfm.default) ||
-          rfm.conditions.exists(c => containsInputStreamResponse(c.responseAs))
-        case ResponseAsBoth(l, r) =>
-          containsInputStreamResponse(l) || containsInputStreamResponse(r)
-        case _ => false
-      }
+    def isInputStream(leaf: GenericResponseAs[_, _]): Boolean = leaf match {
+      case ResponseAsInputStream(_) | ResponseAsInputStreamUnsafe => true
+      case _                                                      => false
+    }
   }
+
+  /** Recursively checks if a response descriptor contains any leaf for which `isLeaf` holds. This inspects through
+    * MappedResponseAs, ResponseAsFromMetadata conditions, and ResponseAsBoth. Returns true if ANY branch might produce
+    * such a response.
+    */
+  private def containsResponse(delegate: GenericResponseAs[_, _], isLeaf: GenericResponseAs[_, _] => Boolean): Boolean =
+    delegate match {
+      case MappedResponseAs(raw, _, _) => containsResponse(raw, isLeaf)
+      case rfm: ResponseAsFromMetadata[_, _] =>
+        containsResponse(rfm.default, isLeaf) || rfm.conditions.exists(c => containsResponse(c.responseAs, isLeaf))
+      case ResponseAsBoth(l, r) => containsResponse(l, isLeaf) || containsResponse(r, isLeaf)
+      case other                => isLeaf(other)
+    }
 
   private def handleBaseWithMulti[T](request: GenericRequest[T, R], curl: CurlHandle, spaces: CurlSpaces)(implicit
       ctx: Context
@@ -324,7 +384,7 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
             // Drain remaining body, then handle normally
             driveToCompletion(multi)
 
-            val responseBody = fromCString((!spaces.bodyResp)._1)
+            val responseBody = rawBody(spaces.bodyResp)
             // Clean up multi resources
             val _ = multi.removeHandle(curl)
             multi.cleanup()
@@ -471,7 +531,7 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
         // Fallback: drain stream to string and use standard path
         val bytes = readInputStreamToByteArray(is)
         is.close()
-        val str = new String(bytes)
+        val str = new String(bytes, StandardCharsets.ISO_8859_1)
         bodyFromResponseAs(ResponseAs(delegate.asInstanceOf[GenericResponseAs[T, Any]]), meta, Left(str))
     }
 
@@ -514,8 +574,7 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
     implicit val z = ctx.zone
     body match { // todo: assign to monad object
       case b: BasicBodyPart =>
-        val str = basicBodyToString(b)
-        lift(curl.option(PostFields, toCString(str)))
+        lift(setPostFields(curl, basicBodyToBytes(b)))
       case m: MultipartBody[R] =>
         val mime = curl.mime
         m.parts.foreach { case p @ Part(name, partBody, _, headers) =>
@@ -533,14 +592,38 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
           }
         }
         lift(curl.option(Mimepost, mime))
-      case StreamBody(_) =>
-        monad.error(new IllegalStateException("CurlBackend does not support stream request body"))
+      case StreamBody(s) =>
+        streamBodyToBytes(s).flatMap(bytes => lift(setPostFields(curl, bytes)))
       case NoBody =>
         // POST with empty body might wait for the input on stdin
         if (method.is(Method.POST)) lift(curl.option(PostFields, c""))
         else monad.unit(CurlCode.Ok)
     }
   }
+
+  /** Sets the request body to exactly the given bytes. The declared size is set explicitly: without it, libcurl uses
+    * the length of the string, which doesn't work for binary data. The bytes have to outlive the transfer, which is why
+    * they are allocated in the context's zone.
+    */
+  private def setPostFields(curl: CurlHandle, bytes: Array[Byte])(implicit ctx: Context): CurlCode = {
+    implicit val z: Zone = ctx.zone
+    val buf = alloc[Byte](bytes.length + 1)
+    var i = 0
+    while (i < bytes.length) { buf(i.toLong) = bytes(i); i += 1 }
+    buf(bytes.length.toLong) = 0.toByte
+    val sizeCode = curl.option(PostFieldSize, bytes.length.toLong)
+    if (sizeCode != CurlCode.Ok) sizeCode else curl.option(PostFields, buf)
+  }
+
+  private def basicBodyToBytes(body: BodyPart[_]): Array[Byte] =
+    body match {
+      case StringBody(b, encoding, _) => b.getBytes(encoding)
+      case ByteArrayBody(b, _)        => b
+      case ByteBufferBody(b, _)       => b.array
+      case InputStreamBody(b, _)      => readInputStreamToByteArray(b)
+      case FileBody(f, _)             => java.nio.file.Files.readAllBytes(f.toPath)
+      case _                          => throw new IllegalArgumentException(s"Unsupported body: $body")
+    }
 
   private def basicBodyToString(body: BodyPart[_]): String =
     body match {
@@ -570,7 +653,7 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
     * (HTTP/2 responses often omit the reason phrase). If headers are empty (e.g. connection failed before any
     * response), returns ("", Nil).
     */
-  private def parseHeadersAndStatus(str: String): (String, Seq[Header]) = {
+  protected def parseHeadersAndStatus(str: String): (String, Seq[Header]) = {
     val lines = str.split("\n").filter(_.trim.nonEmpty)
     if (lines.isEmpty) return ("", Nil)
 
@@ -614,7 +697,7 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
       monad.unit(file)
 
     override protected def regularAsInputStream(response: String): F[InputStream] =
-      monad.unit(new ByteArrayInputStream(response.getBytes))
+      monad.unit(new ByteArrayInputStream(response.getBytes(StandardCharsets.ISO_8859_1)))
 
     override protected def regularAsStream(response: String): F[(Nothing, () => F[Unit])] =
       throw new IllegalStateException("CurlBackend does not support streaming responses")
@@ -633,13 +716,37 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
     override protected def cleanupWhenGotWebSocket(response: Nothing, e: GotAWebSocketException): F[Unit] = response
   }
 
-  private def toByteArray(str: String): F[Array[Byte]] = monad.unit(str.getBytes)
+  private def toByteArray(str: String): F[Array[Byte]] = monad.unit(str.getBytes(StandardCharsets.ISO_8859_1))
+
+  /** The raw response body is represented as a string in which every character is one byte of the body
+    * (ISO-8859-1), so that binary data is preserved exactly, including the zero bytes. It's converted to the requested
+    * type (bytes, a text in the response's charset, ...) by the response description.
+    */
+  private def rawBody(body: Ptr[CurlFetch]): String = {
+    val length = (!body)._2.toInt
+    val bytes = new Array[Byte](length)
+    var i = 0
+    while (i < length) { bytes(i) = !((!body)._1 + i.toLong); i += 1 }
+    new String(bytes, StandardCharsets.ISO_8859_1)
+  }
 
   private def lift(code: CurlCode): F[CurlCode] =
     code match {
       case CurlCode.Ok => monad.unit(code)
       case _           => monad.error(new RuntimeException(s"Command failed with status $code"))
     }
+}
+
+/** Curl backends that don't support any capabilities. */
+abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean)
+    extends GenericCurlBackend[F, Any](_monad, verbose)
+
+/** The resources allocated for a request (the zone with the strings and bodies which libcurl points to, and the
+  * request headers lists). They have to outlive the transfer. Call [[release]] exactly once, after the transfer is
+  * done and the easy handle is cleaned up.
+  */
+final class DetachedResources private[curl] (releaseResources: () => Unit) {
+  def release(): Unit = releaseResources()
 }
 
 /** Curl backends that performs the curl operation with a simple `curl_easy_perform`. */

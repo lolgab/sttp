@@ -131,4 +131,7 @@ private[curl] trait CCurl {
 
   @name("sttp_curl_fd_ready")
   def fdReady(fd: CInt, want: CInt): CInt = extern
+
+  @name("curl_easy_pause")
+  def easyPause(easy: Ptr[Curl], bitmask: CInt): CInt = extern
 }
