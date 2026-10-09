@@ -9,6 +9,7 @@ import sttp.client4.curl.internal.{CurlApi, CurlCode, CurlMCode}
 import sttp.client4.impl.cats.CatsMonadError
 import sttp.client4.wrappers.FollowRedirectsBackend
 
+import java.util.concurrent.ConcurrentHashMap
 import scala.scalanative.libc.stdlib
 import scala.scalanative.meta.LinktimeInfo
 import scala.scalanative.unsafe._
@@ -31,13 +32,22 @@ class CurlCatsAsyncBackend private (drivers: Vector[CurlMultiDriver], next: Ref[
     extends AbstractCurlBackend[IO](new CatsMonadError[IO], verbose)
     with Backend[IO] {
 
+  // the driver which performed a given handle, as the handle has to be cleaned up in a way synchronized with it
+  private val performedBy = new ConcurrentHashMap[Long, CurlMultiDriver]()
+
   override protected def performCurl(c: CurlHandle): IO[CurlCode.CurlCode] =
     if (drivers.isEmpty) CurlCatsAsyncBackend.performBlocking(c)
     else
-      next
-        .modify(i => ((i + 1) % drivers.length, i))
-        .flatMap(i => drivers(i).perform(c))
-        .map(CurlCode(_))
+      next.modify(i => ((i + 1) % drivers.length, i)).flatMap { i =>
+        val driver = drivers(i)
+        IO(performedBy.put(c.toLong, driver)) *> driver.perform(c).map(CurlCode(_))
+      }
+
+  override protected def cleanupCurl(c: CurlHandle): IO[Unit] =
+    IO(Option(performedBy.remove(c.toLong))).flatMap {
+      case Some(driver) => driver.cleanup(c)
+      case None         => super.cleanupCurl(c)
+    }
 }
 
 object CurlCatsAsyncBackend {

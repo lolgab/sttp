@@ -31,6 +31,11 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
   /** Given a [[CurlHandle]], perform the request and return a [[CurlCode]]. */
   protected def performCurl(c: CurlHandle): F[CurlCode]
 
+  /** Cleans up the easy handle after the request completed, failed or was cancelled. Backends which share state between
+    * the handles (e.g. a multi handle) can override this to synchronize the cleanup.
+    */
+  protected def cleanupCurl(c: CurlHandle): F[Unit] = monad.eval(c.cleanup())
+
   /** Same as [[performCurl]], but also checks and throws runtime exceptions on bad [[CurlCode]]s. */
   private final def perform(c: CurlHandle) = performCurl(c).flatMap(lift)
 
@@ -157,12 +162,6 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
       val responseBody = fromCString((!spaces.bodyResp)._1)
       val (statusText, responseHeaders) = parseHeadersAndStatus(fromCString((!spaces.headersResp)._1))
       val httpCode = StatusCode((!spaces.httpCode).toInt)
-      free((!spaces.bodyResp)._1)
-      free((!spaces.headersResp)._1)
-      free(spaces.bodyResp.asInstanceOf[Ptr[CSignedChar]])
-      free(spaces.headersResp.asInstanceOf[Ptr[CSignedChar]])
-      free(spaces.httpCode.asInstanceOf[Ptr[CSignedChar]])
-      curl.cleanup()
 
       val responseMetadata = ResponseMetadata(httpCode, statusText, responseHeaders)
 
@@ -180,7 +179,16 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
           request = request.onlyMetadata
         )
       }
-    }
+    }.ensure(
+      // also when the request fails or is cancelled
+      cleanupCurl(curl).map { _ =>
+        free((!spaces.bodyResp)._1)
+        free((!spaces.headersResp)._1)
+        free(spaces.bodyResp.asInstanceOf[Ptr[CSignedChar]])
+        free(spaces.headersResp.asInstanceOf[Ptr[CSignedChar]])
+        free(spaces.httpCode.asInstanceOf[Ptr[CSignedChar]])
+      }
+    )
   }
 
   private def handleFile[T](request: GenericRequest[T, R], curl: CurlHandle, file: SttpFile, spaces: CurlSpaces)(
@@ -198,7 +206,6 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
       val httpCode = StatusCode((!spaces.httpCode).toInt)
       free(spaces.httpCode.asInstanceOf[Ptr[CSignedChar]])
       fclose(outputFilePtr)
-      curl.cleanup()
       val responseMetadata = ResponseMetadata(httpCode, "", List.empty)
       val body: F[T] = bodyFromResponseAs(request.response, responseMetadata, Left(outputPath))
       monad.map(body) { b =>
@@ -211,7 +218,7 @@ abstract class AbstractCurlBackend[F[_]](_monad: MonadError[F], verbose: Boolean
           request = request.onlyMetadata
         )
       }
-    }
+    }.ensure(cleanupCurl(curl))
   }
 
   private object InputStreamResponseDetector {
