@@ -52,7 +52,7 @@ private[cats] final class CurlMultiDriver private (
 
   // --- state guarded by `lock`, mutated by libcurl's callbacks ---
   private var closed = false
-  private final class Sock(var what: Int, val gen: Long) { var gained: Int = 0 }
+  private final class Sock(var what: Int, val gen: Long, var gained: Int = 0)
   private val sockets = mutable.HashMap.empty[Int, Sock]
   private var socketGen = 0L
   private var timeoutMs: Long = -1L
