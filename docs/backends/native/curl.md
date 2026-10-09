@@ -108,8 +108,9 @@ compute pool) to avoid contention. In single-threaded mode, a single multi handl
 
 ### Requirements
 
-The backend relies on the `FileDescriptorPoller` of the runtime. The default `IORuntime` on Scala Native provides one
-(epoll/kqueue); if a custom runtime doesn't, each transfer is driven from the blocking thread pool instead.
+The backend relies on the `FileDescriptorPoller` of the Cats Effect runtime. The default `IORuntime` on Scala Native
+provides one on Linux (epoll) and macOS (kqueue), but not on other platforms (e.g. Windows); there, creating the backend
+fails with `No FileDescriptorPoller installed in this IORuntime`.
 
 Limitations: WebSockets and `Stream`-based responses are not supported, as with the other curl backends. Responses read
 using `asInputStream` work, but they are driven by the shared blocking implementation (`curl_multi_perform` +
