@@ -34,7 +34,7 @@ import scala.scalanative.unsafe._
   *
   * To scale across worker threads, the backend uses several drivers.
   */
-private[cats] final class CurlMultiDriver private (
+private[curl] final class CurlMultiDriver private (
     id: Long,
     multi: CurlMultiHandle,
     runningPtr: Ptr[CInt],
@@ -110,6 +110,20 @@ private[cats] final class CurlMultiDriver private (
     * share state, so this can't happen concurrently with other calls into the multi handle.
     */
   def cleanup(easy: CurlHandle): IO[Unit] = locked(easy.cleanup())
+
+  /** Runs `body` while holding the lock of the multi handle: it's the only way to safely use the easy handles which
+    * were added to it (e.g. to read the info of a transfer in progress).
+    */
+  def withLock[A](body: => A): IO[A] = locked(body)
+
+  /** Runs `io` in a fiber, which is cancelled when the driver is released. */
+  def supervise[A](io: IO[A]): IO[FiberIO[A]] = supervisor.supervise(io)
+
+  /** Resumes a transfer paused by returning `CURL_WRITEFUNC_PAUSE` from the write callback. */
+  def resume(easy: CurlHandle): IO[Unit] = pump {
+    val _ = CCurl.easyPause(easy, 0)
+    timeoutAction()
+  }
 
   /** Stops the driver: transfers still in progress fail. The watcher fibers are cancelled by the supervisor. */
   private def shutdown: IO[Unit] =
@@ -264,7 +278,7 @@ private[cats] final class CurlMultiDriver private (
 
 }
 
-private[cats] object CurlMultiDriver {
+private[curl] object CurlMultiDriver {
   // CURL_POLL_* (also the same values as CURL_CSELECT_IN/OUT)
   private val PollIn = 1
   private val PollOut = 2
@@ -281,8 +295,8 @@ private[cats] object CurlMultiDriver {
   private val nextId = new AtomicLong(0)
   private val registry = new ConcurrentHashMap[Long, CurlMultiDriver]()
 
-  private def idToPtr(id: Long): Ptr[Byte] = fromRawPtr[Byte](Intrinsics.castLongToRawPtr(id))
-  private def ptrToId(p: Ptr[Byte]): Long = Intrinsics.castRawPtrToLong(toRawPtr(p))
+  private[cats] def idToPtr(id: Long): Ptr[Byte] = fromRawPtr[Byte](Intrinsics.castLongToRawPtr(id))
+  private[cats] def ptrToId(p: Ptr[Byte]): Long = Intrinsics.castRawPtrToLong(toRawPtr(p))
 
   private val socketCallback: CFuncPtr5[Ptr[Curl], CInt, CInt, Ptr[Byte], Ptr[Byte], CInt] =
     (_: Ptr[Curl], fd: CInt, what: CInt, userp: Ptr[Byte], _: Ptr[Byte]) => {
