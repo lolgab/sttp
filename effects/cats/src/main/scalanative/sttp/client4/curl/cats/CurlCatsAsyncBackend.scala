@@ -22,8 +22,9 @@ import scala.scalanative.unsigned._
   * (epoll on Linux, kqueue on macOS), so curl shares the event loop with the rest of the application.
   *
   * libcurl multi handles aren't thread-safe, so each handle is guarded by a fiber-aware mutex (waiting fibers are
-  * suspended, no thread is blocked), which is only held for the short, non-blocking libcurl calls. In multi-threaded mode, requests are spread over `parallelism` multi handles to avoid
-  * contention; in single-threaded mode, a single handle is used.
+  * suspended, no thread is blocked), which is only held for the short, non-blocking libcurl calls. In multi-threaded mode, requests are spread over one multi
+  * handle per available processor (the default size of the cats-effect compute pool) to avoid contention; in
+  * single-threaded mode, a single handle is used.
   *
   * If the runtime has no [[FileDescriptorPoller]] (e.g. a custom `IORuntime` with the default sleep-based polling
   * system), the backend falls back to driving each transfer from the blocking thread pool.
@@ -52,8 +53,8 @@ class CurlCatsAsyncBackend private (drivers: Vector[CurlMultiDriver], next: Ref[
 
 object CurlCatsAsyncBackend {
 
-  /** The default number of multi handles: one per available processor in multi-threaded mode, one otherwise. */
-  def defaultParallelism: Int =
+  /** The number of multi handles: one per available processor in multi-threaded mode, one otherwise. */
+  private def multiHandles: Int =
     if (LinktimeInfo.isMultithreadingEnabled) Math.max(1, Runtime.getRuntime.availableProcessors()) else 1
 
   /** Creates a backend. When the resource is released, the requests which are still in progress fail, and the libcurl
@@ -61,20 +62,16 @@ object CurlCatsAsyncBackend {
     *
     * @param verbose
     *   If true, logs request and response summary to the console.
-    * @param parallelism
-    *   The number of libcurl multi handles to spread the requests over.
     */
-  def resource(verbose: Boolean = false, parallelism: Int = defaultParallelism): Resource[IO, Backend[IO]] = {
-    require(parallelism > 0, "parallelism must be positive")
+  def resource(verbose: Boolean = false): Resource[IO, Backend[IO]] =
     for {
       poller <- Resource.eval(FileDescriptorPoller.find)
       // without a poller, each transfer gets its own multi handle, see `performBlocking`
       drivers <- poller.fold(Resource.pure[IO, List[CurlMultiDriver]](Nil))(p =>
-        List.fill(parallelism)(CurlMultiDriver.resource(p)).sequence
+        List.fill(multiHandles)(CurlMultiDriver.resource(p)).sequence
       )
       next <- Resource.eval(Ref.of[IO, Int](0))
     } yield FollowRedirectsBackend(new CurlCatsAsyncBackend(drivers.toVector, next, verbose))
-  }
 
   /** Fallback when there's no poller: a dedicated multi handle per transfer, driven on the blocking pool in short
     * slices, so that the fiber stays cancelable.

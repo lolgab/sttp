@@ -101,15 +101,10 @@ multi handles are freed.
 
 ### Threading
 
-libcurl multi handles are not thread-safe, so each one is guarded by a fiber-aware mutex (fibers waiting for it are suspended, no thread is
-blocked), held only for the short, non-blocking
-libcurl calls. When Scala Native multithreading is enabled, requests are spread over several multi handles to avoid
-contention; the number can be set with the `parallelism` parameter (defaults to the number of available processors, or
-`1` in single-threaded mode):
-
-```scala
-CurlCatsAsyncBackend.resource(parallelism = 2)
-```
+libcurl multi handles are not thread-safe, so each one is guarded by a fiber-aware mutex (fibers waiting for it are
+suspended, no thread is blocked), held only for the short, non-blocking libcurl calls. When Scala Native multithreading
+is enabled, requests are spread over one multi handle per available processor (the default size of the Cats Effect
+compute pool) to avoid contention. In single-threaded mode, a single multi handle is used.
 
 ### Requirements
 
