@@ -96,8 +96,8 @@ object Main extends IOApp.Simple:
     }
 ```
 
-`CurlCatsAsyncBackend()` creates a backend directly; it should be closed after use. The `resource()` variant closes it
-for you.
+The backend is created as a `Resource`: when it is released, requests which are still in progress fail, and the libcurl
+multi handles are freed.
 
 ### Threading
 

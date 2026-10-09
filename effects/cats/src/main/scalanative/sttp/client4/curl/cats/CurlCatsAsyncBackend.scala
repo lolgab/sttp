@@ -1,6 +1,7 @@
 package sttp.client4.curl.cats
 
-import cats.effect.{FileDescriptorPoller, IO, Resource}
+import cats.effect.{FileDescriptorPoller, IO, Ref, Resource}
+import cats.syntax.all._
 import sttp.client4.Backend
 import sttp.client4.curl.AbstractCurlBackend
 import sttp.client4.curl.internal.CurlApi._
@@ -8,7 +9,6 @@ import sttp.client4.curl.internal.{CurlApi, CurlCode, CurlMCode}
 import sttp.client4.impl.cats.CatsMonadError
 import sttp.client4.wrappers.FollowRedirectsBackend
 
-import java.util.concurrent.atomic.AtomicInteger
 import scala.scalanative.libc.stdlib
 import scala.scalanative.meta.LinktimeInfo
 import scala.scalanative.unsafe._
@@ -27,21 +27,17 @@ import scala.scalanative.unsigned._
   * If the runtime has no [[FileDescriptorPoller]] (e.g. a custom `IORuntime` with the default sleep-based polling
   * system), the backend falls back to driving each transfer from the blocking thread pool.
   */
-class CurlCatsAsyncBackend private (drivers: Array[CurlMultiDriver], verbose: Boolean)
+class CurlCatsAsyncBackend private (drivers: Vector[CurlMultiDriver], next: Ref[IO, Int], verbose: Boolean)
     extends AbstractCurlBackend[IO](new CatsMonadError[IO], verbose)
     with Backend[IO] {
 
-  private val next = new AtomicInteger(0)
-
   override protected def performCurl(c: CurlHandle): IO[CurlCode.CurlCode] =
-    FileDescriptorPoller.find.flatMap {
-      case Some(poller) =>
-        val driver = drivers(Math.floorMod(next.getAndIncrement(), drivers.length))
-        driver.perform(poller, c).map(CurlCode(_))
-      case None => CurlCatsAsyncBackend.performBlocking(c)
-    }
-
-  override def close(): IO[Unit] = drivers.foldLeft(IO.unit)(_ *> _.close)
+    if (drivers.isEmpty) CurlCatsAsyncBackend.performBlocking(c)
+    else
+      next
+        .modify(i => ((i + 1) % drivers.length, i))
+        .flatMap(i => drivers(i).perform(c))
+        .map(CurlCode(_))
 }
 
 object CurlCatsAsyncBackend {
@@ -50,20 +46,24 @@ object CurlCatsAsyncBackend {
   def defaultParallelism: Int =
     if (LinktimeInfo.isMultithreadingEnabled) Math.max(1, Runtime.getRuntime.availableProcessors()) else 1
 
-  /** Creates a backend, which is closed when the resource is released.
+  /** Creates a backend. When the resource is released, the requests which are still in progress fail, and the libcurl
+    * multi handles are freed.
     *
     * @param verbose
     *   If true, logs request and response summary to the console.
     * @param parallelism
     *   The number of libcurl multi handles to spread the requests over.
     */
-  def resource(verbose: Boolean = false, parallelism: Int = defaultParallelism): Resource[IO, Backend[IO]] =
-    Resource.make(IO(apply(verbose, parallelism)))(_.close())
-
-  /** Creates a backend. It should be closed after use. */
-  def apply(verbose: Boolean = false, parallelism: Int = defaultParallelism): Backend[IO] = {
+  def resource(verbose: Boolean = false, parallelism: Int = defaultParallelism): Resource[IO, Backend[IO]] = {
     require(parallelism > 0, "parallelism must be positive")
-    FollowRedirectsBackend(new CurlCatsAsyncBackend(Array.fill(parallelism)(CurlMultiDriver()), verbose))
+    for {
+      poller <- Resource.eval(FileDescriptorPoller.find)
+      // without a poller, each transfer gets its own multi handle, see `performBlocking`
+      drivers <- poller.fold(Resource.pure[IO, List[CurlMultiDriver]](Nil))(p =>
+        List.fill(parallelism)(CurlMultiDriver.resource(p)).sequence
+      )
+      next <- Resource.eval(Ref.of[IO, Int](0))
+    } yield FollowRedirectsBackend(new CurlCatsAsyncBackend(drivers.toVector, next, verbose))
   }
 
   /** Fallback when there's no poller: a dedicated multi handle per transfer, driven on the blocking pool in short

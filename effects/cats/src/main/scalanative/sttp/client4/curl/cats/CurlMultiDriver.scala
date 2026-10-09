@@ -1,7 +1,8 @@
 package sttp.client4.curl.cats
 
-import cats.effect.{FiberIO, IO, SyncIO}
-import cats.effect.std.Mutex
+import cats.effect.{FiberIO, IO, Ref, Resource}
+import cats.effect.std.{Mutex, Supervisor}
+import cats.syntax.all._
 import cats.effect.{FileDescriptorPoller, FileDescriptorPollHandle}
 import sttp.client4.curl.internal.CurlApi._
 import sttp.client4.curl.internal._
@@ -28,43 +29,35 @@ import scala.scalanative.unsigned._
   * happens outside of the lock. The libcurl multi calls are documented to be non-blocking, so they are suspended with
   * `IO.apply` rather than `IO.blocking`. Fibers can freely migrate between the worker threads.
   *
+  * Which state is a `Ref` and which is not: the state touched by libcurl's callbacks (`sockets`, `completions`, the timer
+  * request, `closed`) is plain mutable state guarded by `lock`, as the callbacks are synchronous C functions which can't
+  * run `IO`. The fibers watching the sockets are effectful, immutable state, kept in a `Ref` and updated while holding
+  * `reconcileMutex`, which serializes the effectful reconciliation.
+  *
   * To scale across worker threads, the backend uses several drivers.
   */
-private[cats] final class CurlMultiDriver private () {
+private[cats] final class CurlMultiDriver private (
+    id: Long,
+    multi: CurlMultiHandle,
+    poller: FileDescriptorPoller,
+    supervisor: Supervisor[IO],
+    lock: Mutex[IO],
+    reconcileMutex: Mutex[IO],
+    fibers: Ref[IO, CurlMultiDriver.Fibers]
+) {
   import CurlMultiDriver._
 
-  private val id: Long = nextId.incrementAndGet()
-  private val multi: CurlMultiHandle = CurlApi.multiInit
   private val runningPtr: Ptr[CInt] = stdlib.calloc(1.toUSize, sizeof[CInt]).asInstanceOf[Ptr[CInt]]
   private val easyOut: Ptr[Ptr[Curl]] = stdlib.calloc(1.toUSize, sizeof[Ptr[Curl]]).asInstanceOf[Ptr[Ptr[Curl]]]
-  @volatile private var poller: FileDescriptorPoller = _
-  private var closed = false
 
-  // --- state guarded by `lock` ---
-  private val lock: Mutex[IO] = Mutex.in[SyncIO, IO].unsafeRunSync()
+  // --- state guarded by `lock`, mutated by libcurl's callbacks ---
+  private var closed = false
   private final class Sock(var what: Int, val gen: Long) { var gained: Int = 0 }
   private val sockets = mutable.HashMap.empty[Int, Sock]
   private var socketGen = 0L
   private var timeoutMs: Long = -1L
   private var timerGen = 0L
   private val completions = mutable.HashMap.empty[Long, Either[Throwable, Int] => Unit]
-
-  // --- state guarded by `reconcileMutex` (never acquired while holding `lock`) ---
-  private val reconcileMutex: Mutex[IO] = Mutex.in[SyncIO, IO].unsafeRunSync()
-  private final class Watcher(val gen: Long, val fiber: FiberIO[Unit])
-  private val watchers = mutable.HashMap.empty[Int, Watcher]
-  // fibers of removed watchers; a new watcher on the same fd number waits for the old one to deregister first
-  private val retired = mutable.HashMap.empty[Int, FiberIO[Unit]]
-  private var timer: Option[(Long, FiberIO[Unit])] = None
-
-  {
-    registry.put(id, this)
-    val userp = idToPtr(id)
-    CCurl.multiSetoptPtr(multi, MultiSocketFunction, CFuncPtr.toPtr(socketCallback))
-    CCurl.multiSetoptPtr(multi, MultiSocketData, userp)
-    CCurl.multiSetoptPtr(multi, MultiTimerFunction, CFuncPtr.toPtr(timerCallback))
-    CCurl.multiSetoptPtr(multi, MultiTimerData, userp)
-  }
 
   // ---------------------------------------------------------------------------------------------------------------
   // callbacks (invoked by libcurl, under `lock`)
@@ -90,8 +83,7 @@ private[cats] final class CurlMultiDriver private () {
   // public API
 
   /** Performs the transfer of `easy`, which must be fully configured. The handle is not cleaned up. */
-  def perform(fdPoller: FileDescriptorPoller, easy: CurlHandle): IO[Int] = IO.async[Int] { cb =>
-    poller = fdPoller
+  def perform(easy: CurlHandle): IO[Int] = IO.async[Int] { cb =>
     val key = easy.toLong
     locked {
       if (closed) { cb(Left(new IllegalStateException("The curl backend is closed"))); false }
@@ -110,19 +102,15 @@ private[cats] final class CurlMultiDriver private () {
     }
   }
 
-  def close: IO[Unit] =
-    reconcileMutex.lock.surround {
-      val cancelAll = watchers.values.map(_.fiber).toList ++ timer.map(_._2).toList
-      IO { watchers.clear(); timer = None } *> cancelAll.foldLeft(IO.unit)(_ *> cancelAsync(_))
-    } *> locked {
-      if (!closed) {
-        closed = true
-        multi.cleanup()
-        registry.remove(id)
-        stdlib.free(runningPtr.asInstanceOf[Ptr[Byte]])
-        stdlib.free(easyOut.asInstanceOf[Ptr[Byte]])
-      }
-    }
+  /** Stops the driver: transfers still in progress fail. The watcher fibers are cancelled by the supervisor. */
+  private def shutdown: IO[Unit] =
+    locked {
+      closed = true
+      registry.remove(id)
+      val failed = completions.values.toList
+      completions.clear()
+      failed
+    }.flatMap(_.traverse_(cb => IO(cb(Left(new IllegalStateException("The curl backend is closed"))))))
 
   // ---------------------------------------------------------------------------------------------------------------
   // internals
@@ -170,46 +158,46 @@ private[cats] final class CurlMultiDriver private () {
     res
   }
 
+  /** Brings the fibers watching the sockets and the timer in line with what curl asked for. */
   private def reconcile: IO[Unit] =
     reconcileMutex.lock.surround {
-      locked {
-        val desired = sockets.map { case (fd, s) => (fd, s.gen) }.toMap
-        val kicks = sockets.collect { case (fd, s) if s.gained != 0 => (fd, s.gained) }.toList
-        sockets.valuesIterator.foreach(_.gained = 0)
-        (desired, kicks, timerGen, timeoutMs)
-      }.flatMap { case (desired, kicks, tGen, tMs) =>
-        val stale = watchers.collect { case (fd, w) if !desired.get(fd).contains(w.gen) => fd }.toList
-        val stop = stale.foldLeft(IO.unit) { (acc, fd) =>
-          val w = watchers.remove(fd).get
-          retired.put(fd, w.fiber)
-          acc *> cancelAsync(w.fiber)
+      for {
+        snapshot <- locked {
+          val desired = sockets.map { case (fd, s) => (fd, s.gen) }.toMap
+          val kicks = sockets.collect { case (fd, s) if s.gained != 0 => (fd, s.gained) }.toList
+          sockets.valuesIterator.foreach(_.gained = 0)
+          Snapshot(desired, kicks, timerGen, timeoutMs)
         }
-        val start = desired.toList.foldLeft(IO.unit) { case (acc, (fd, gen)) =>
-          if (watchers.contains(fd)) acc
-          else acc *> startWatcher(fd, retired.remove(fd)).map(f => watchers.put(fd, new Watcher(gen, f))).void
+        current <- fibers.get
+        // watchers of sockets which are gone, or were closed and reopened under the same fd number
+        stale = current.watchers.collect { case (fd, w) if !snapshot.desired.get(fd).contains(w.gen) => fd }.toList
+        _ <- stale.traverse_(fd => cancelAsync(current.watchers(fd).fiber))
+        kept = current.watchers -- stale
+        retired = current.retired ++ stale.map(fd => fd -> current.watchers(fd).fiber)
+        toStart = snapshot.desired.filterNot { case (fd, _) => kept.contains(fd) }.toList
+        started <- toStart.traverse { case (fd, gen) =>
+          startWatcher(fd, retired.get(fd)).map(f => fd -> Watcher(gen, f))
         }
-        val timerStep: IO[Boolean] =
-          if (timer.exists(_._1 == tGen)) IO.pure(false)
+        timerChange <-
+          if (current.timer.exists(_._1 == snapshot.timerGen)) IO.pure((current.timer, false))
           else {
-            val old = timer
-            timer = None
-            val cancelOld = old.fold(IO.unit)(t => cancelAsync(t._2))
-            if (tMs < 0) cancelOld.as(false)
-            else if (tMs == 0) cancelOld.as(true)
+            val cancelOld = current.timer.traverse_(t => cancelAsync(t._2))
+            if (snapshot.timeoutMs < 0) cancelOld.as((None, false))
+            else if (snapshot.timeoutMs == 0) cancelOld.as((None, true))
             else
-              cancelOld *> (IO.sleep(tMs.millis) *> pump(timeoutAction())).start
-                .map { f => timer = Some((tGen, f)); false }
+              cancelOld *> supervisor.supervise(IO.sleep(snapshot.timeoutMs.millis) *> pump(timeoutAction())).map {
+                f => (Some((snapshot.timerGen, f)), false)
+              }
           }
-        (stop *> start *> timerStep).map(fireNow => (kicks, fireNow))
-      }
+        (timer, fireNow) = timerChange
+        _ <- fibers.set(Fibers(kept ++ started, retired -- toStart.map(_._1), timer))
+      } yield (snapshot.kicks, fireNow)
     }.flatMap { case (kicks, fireNow) =>
-      val fire = if (fireNow) pump(timeoutAction()) else IO.unit
       // the interest of a socket was extended: its readiness edge might have been consumed already
-      val kick = kicks.foldLeft(IO.unit) { case (acc, (fd, gained)) =>
-        acc *> (if ((gained & PollIn) != 0) serve(fd, PollIn) else IO.unit) *>
-          (if ((gained & PollOut) != 0) serve(fd, PollOut) else IO.unit)
+      val kick = kicks.traverse_ { case (fd, gained) =>
+        serve(fd, PollIn).whenA((gained & PollIn) != 0) *> serve(fd, PollOut).whenA((gained & PollOut) != 0)
       }
-      fire *> kick
+      pump(timeoutAction()).whenA(fireNow) *> kick
     }
 
   /** Cancels without waiting: the fiber being cancelled might be the one running this code. */
@@ -224,11 +212,12 @@ private[cats] final class CurlMultiDriver private () {
         h.pollReadRec[Unit, Nothing](())(_ => serve(fd, PollIn) *> blocked),
         h.pollWriteRec[Unit, Nothing](())(_ => serve(fd, PollOut) *> blocked)
       ).void
-    (previous.fold(IO.unit)(_.join.void) *>
-      poller.registerFileDescriptor(fd, monitorReadReady = true, monitorWriteReady = true).use(loop))
-      // deregistering fails if curl already closed the socket; there is nothing to do about it then
-      .handleError(_ => ())
-      .start
+    supervisor.supervise(
+      (previous.traverse_(_.join) *>
+        poller.registerFileDescriptor(fd, monitorReadReady = true, monitorWriteReady = true).use(loop))
+        // deregistering fails if curl already closed the socket; there is nothing to do about it then
+        .handleError(_ => ())
+    )
   }
 
   /** The readiness notifications are edge-triggered (epoll), so we have to keep driving curl as long as the socket
@@ -243,6 +232,11 @@ private[cats] final class CurlMultiDriver private () {
           case true  => if (n >= 31) IO.cede *> go(0) else go(n + 1)
         }
     go(0)
+  }
+
+  private def free(): Unit = {
+    stdlib.free(runningPtr.asInstanceOf[Ptr[Byte]])
+    stdlib.free(easyOut.asInstanceOf[Ptr[Byte]])
   }
 }
 
@@ -279,5 +273,40 @@ private[cats] object CurlMultiDriver {
       0
     }
 
-  def apply(): CurlMultiDriver = new CurlMultiDriver()
+  private final case class Watcher(gen: Long, fiber: FiberIO[Unit])
+
+  /** The effectful part of the driver's state. */
+  private final case class Fibers(
+      watchers: Map[Int, Watcher],
+      // fibers of removed watchers; a new watcher on the same fd number waits for the old one to deregister first
+      retired: Map[Int, FiberIO[Unit]],
+      timer: Option[(Long, FiberIO[Unit])]
+  )
+
+  private final case class Snapshot(desired: Map[Int, Long], kicks: List[(Int, Int)], timerGen: Long, timeoutMs: Long)
+
+  /** Creates a driver with its own multi handle. When released, the driver fails the transfers in progress, stops the
+    * fibers watching the sockets, and frees the multi handle.
+    */
+  def resource(poller: FileDescriptorPoller): Resource[IO, CurlMultiDriver] =
+    for {
+      id <- Resource.eval(IO(nextId.incrementAndGet()))
+      // released last, when no fiber can call into the handle anymore
+      multi <- Resource.make(IO(CurlApi.multiInit))(m => IO(m.cleanup()))
+      lock <- Resource.eval(Mutex[IO])
+      reconcileMutex <- Resource.eval(Mutex[IO])
+      fibers <- Resource.eval(Ref.of[IO, Fibers](Fibers(Map.empty, Map.empty, None)))
+      supervisor <- Supervisor[IO](await = false)
+      driver <- Resource.make(IO {
+        val d = new CurlMultiDriver(id, multi, poller, supervisor, lock, reconcileMutex, fibers)
+        registry.put(id, d)
+        val userp = idToPtr(id)
+        CCurl.multiSetoptPtr(multi, MultiSocketFunction, CFuncPtr.toPtr(socketCallback))
+        CCurl.multiSetoptPtr(multi, MultiSocketData, userp)
+        CCurl.multiSetoptPtr(multi, MultiTimerFunction, CFuncPtr.toPtr(timerCallback))
+        CCurl.multiSetoptPtr(multi, MultiTimerData, userp)
+        d
+      })(d => d.shutdown)
+      _ <- Resource.onFinalize(IO(driver.free()))
+    } yield driver
 }
