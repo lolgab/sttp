@@ -2,7 +2,7 @@ package sttp.client4.curl.fs2
 
 import cats.effect.{IO, Resource}
 import cats.syntax.all._
-import fs2.io.file.Files
+import fs2.io.file.{Files, Path}
 import fs2.{Chunk, Stream}
 import sttp.capabilities.fs2.Fs2Streams
 import sttp.client4._
@@ -72,7 +72,7 @@ class CurlFs2Backend private (drivers: CurlDrivers, verbose: Boolean)
           _ <- poll(body.awaitHeaders)
           // libcurl handles can't be used outside of the lock while their transfer is in progress
           info <- driver.withLock {
-            curl.info(CurlInfo.ResponseCode, spaces.httpCode)
+            val _ = curl.info(CurlInfo.ResponseCode, spaces.httpCode)
             ((!spaces.httpCode).toInt, fromCString((!spaces.headersResp)._1))
           }
           code = info._1
@@ -109,7 +109,7 @@ class CurlFs2Backend private (drivers: CurlDrivers, verbose: Boolean)
       ): IO[(Stream[IO, Byte], IO[Unit])] =
         IO.pure(replayableBody match {
           case Left(bytes)     => (Stream.chunk(Chunk.array(bytes)), IO.unit)
-          case Right(sttpFile) => (Files[IO].readAll(sttpFile.toPath, 32 * 1024), IO.unit)
+          case Right(sttpFile) => (Files[IO].readAll(Path.fromNioPath(sttpFile.toPath)), IO.unit)
         })
 
       override protected def regularIgnore(response: (Stream[IO, Byte], IO[Unit])): IO[Unit] =
@@ -119,7 +119,7 @@ class CurlFs2Backend private (drivers: CurlDrivers, verbose: Boolean)
         response._1.compile.to(Chunk).map(_.toArray)
 
       override protected def regularAsFile(response: (Stream[IO, Byte], IO[Unit]), file: SttpFile): IO[SttpFile] =
-        response._1.through(Files[IO].writeAll(file.toPath)).compile.drain.as(file)
+        response._1.through(Files[IO].writeAll(Path.fromNioPath(file.toPath))).compile.drain.as(file)
 
       override protected def regularAsStream(
           response: (Stream[IO, Byte], IO[Unit])

@@ -1,6 +1,6 @@
 package sttp.client4.curl.cats
 
-import cats.effect.{FileDescriptorPoller, IO, Resource}
+import cats.effect.{IO, Resource}
 import sttp.client4.Backend
 import sttp.client4.curl.AbstractCurlBackend
 import sttp.client4.curl.internal.CurlApi._
@@ -20,7 +20,7 @@ import sttp.client4.wrappers.FollowRedirectsBackend
   * mode, requests are spread over one multi handle per available processor (the default size of the cats-effect
   * compute pool) to avoid contention; in single-threaded mode, a single handle is used.
   *
-  * The runtime must provide a [[FileDescriptorPoller]]. The default `IORuntime` does on Linux (epoll) and macOS
+  * The runtime must provide a [[cats.effect.FileDescriptorPoller]]. The default `IORuntime` does on Linux (epoll) and macOS
   * (kqueue), but not on other platforms (e.g. Windows): creating the backend fails there.
   */
 class CurlCatsAsyncBackend private (drivers: CurlDrivers, verbose: Boolean)

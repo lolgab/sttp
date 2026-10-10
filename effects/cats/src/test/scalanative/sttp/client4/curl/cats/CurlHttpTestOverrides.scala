@@ -13,10 +13,7 @@ trait CurlHttpTestOverrides extends HttpTest[IO] with BlockingConvertToFuture {
 
   // `shouldBe Symbol("empty")` is implemented using reflection, which is not available on Native
   override protected def expectRedirectResponse(response: IO[Response[String]], code: Int): Future[Assertion] =
-    response.toFuture().map { resp =>
-      resp.code shouldBe StatusCode(code)
-      resp.history.isEmpty shouldBe true
-    }
+    response.toFuture().map(resp => (resp.code, resp.history.isEmpty) shouldBe ((StatusCode(code), true)))
 
   // each part is sent using the charset of the whole body
   override protected def supportsCustomMultipartEncoding = false

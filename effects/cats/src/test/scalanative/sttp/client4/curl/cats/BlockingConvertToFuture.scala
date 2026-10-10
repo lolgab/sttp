@@ -22,7 +22,7 @@ trait BlockingConvertToFuture extends CatsTestBase {
 }
 
 private final class SynchronousFuture[T](outcome: Try[T]) extends Future[T] {
-  override def onComplete[U](f: Try[T] => U)(implicit executor: ExecutionContext): Unit = { f(outcome); () }
+  override def onComplete[U](f: Try[T] => U)(implicit executor: ExecutionContext): Unit = { val _ = f(outcome) }
   override def isCompleted: Boolean = true
   override def value: Option[Try[T]] = Some(outcome)
 
