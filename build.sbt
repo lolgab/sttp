@@ -144,7 +144,7 @@ val akkaHttp = "com.typesafe.akka" %% "akka-http" % "10.2.10"
 val akkaStreamVersion = "2.6.20"
 val akkaStreams = "com.typesafe.akka" %% "akka-stream" % akkaStreamVersion
 
-val pekkoHttp = "org.apache.pekko" %% "pekko-http" % "1.4.0"
+val pekkoHttp = "org.apache.pekko" %% "pekko-http" % "1.4.1"
 val pekkoStreamVersion = "1.7.1"
 val pekkoStreams = "org.apache.pekko" %% "pekko-stream" % pekkoStreamVersion
 
@@ -723,7 +723,7 @@ lazy val armeriaBackend = (projectMatrix in file("armeria-backend"))
   .settings(testServerSettings)
   .settings(
     name := "armeria-backend",
-    libraryDependencies += "com.linecorp.armeria" % "armeria" % "1.41.1"
+    libraryDependencies += "com.linecorp.armeria" % "armeria" % "1.42.0"
   )
   .jvmPlatform(scalaVersions = scala2And3)
   .dependsOn(core % compileAndTest)
